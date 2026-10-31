@@ -1,0 +1,695 @@
+#!/usr/bin/env python3
+"""CleanShot Recording — DynamicLake JSON plugin.
+
+Shows a red recording indicator in the notch while CleanShot X is
+capturing the screen.
+
+Detection is based on the video file CleanShot X keeps open for writing
+while it records. No Accessibility permission is required.
+
+Diagnostics are written to ~/Library/Logs/DynamicLake/CleanShotPlugin.log.
+"""
+
+from __future__ import annotations
+
+import ctypes
+import ctypes.util
+import json
+import os
+import re
+import select
+import socket
+import struct
+import subprocess
+import sys
+import time
+from pathlib import Path
+
+SCHEMA_VERSION = 1
+ACTIVITY_ID = "com.benjamin.cleanshot-recording"
+PLUGIN_TITLE = "CleanShot Recording"
+
+POLL_INTERVAL = 0.4
+LINGER_SECONDS = 2.5
+UPDATE_INTERVAL = 1.0
+
+VIDEO_EXTENSIONS = (
+    ".mov",
+    ".mp4",
+    ".m4v",
+    ".mkv",
+    ".avi",
+    ".ts",
+)
+
+FORCE_FILES = (
+    "/tmp/cleanshot-recording-force",
+    str(Path.home() / ".cleanshot-recording-force"),
+)
+
+LOG_PATH = Path.home() / "Library/Logs/DynamicLake/CleanShotPlugin.log"
+
+
+# --------------------------------------------------------------------------
+# logging
+
+
+def log(message: str) -> None:
+    try:
+        LOG_PATH.parent.mkdir(parents=True, exist_ok=True)
+        if LOG_PATH.exists() and LOG_PATH.stat().st_size > 1_000_000:
+            LOG_PATH.replace(LOG_PATH.with_suffix(".log.1"))
+        with LOG_PATH.open("a", encoding="utf-8") as handle:
+            handle.write(
+                f"{time.strftime('%Y-%m-%dT%H:%M:%SZ', time.gmtime())} [{os.getpid()}] {message}\n"
+            )
+    except Exception:
+        pass
+
+
+# --------------------------------------------------------------------------
+# DynamicLake JSON socket client
+
+
+class Client:
+    def __init__(self) -> None:
+        self.socket_path = (
+            os.environ.get("DYNAMICLAKE_JSON_SOCKET")
+            or f"/tmp/dynamiclake-json-{os.getuid()}.sock"
+        )
+        self.socket: socket.socket | None = None
+        self.buffer = bytearray()
+        self.expected_length: int | None = None
+
+    def connect(self) -> None:
+        sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        sock.connect(self.socket_path)
+        sock.setblocking(False)
+        self.socket = sock
+
+    def close(self) -> None:
+        if self.socket is None:
+            return
+        try:
+            self.socket.close()
+        except Exception:
+            pass
+        self.socket = None
+
+    def send(self, message: dict) -> None:
+        if self.socket is None:
+            raise RuntimeError("not connected")
+        payload = json.dumps(message, separators=(",", ":")).encode("utf-8")
+        frame = struct.pack(">I", len(payload)) + payload
+        self.socket.settimeout(1.0)
+        try:
+            self.socket.sendall(frame)
+        finally:
+            try:
+                self.socket.setblocking(False)
+            except Exception:
+                pass
+
+    def read_available(self, timeout: float = 0.0) -> list[dict]:
+        if self.socket is None:
+            return []
+        messages: list[dict] = []
+        try:
+            ready, _, _ = select.select([self.socket], [], [], timeout)
+        except (OSError, ValueError):
+            return []
+        for _ in ready:
+            chunk = self.socket.recv(65536)
+            if not chunk:
+                raise ConnectionError("host closed the socket")
+            self.buffer.extend(chunk)
+        while True:
+            if self.expected_length is None:
+                if len(self.buffer) < 4:
+                    break
+                self.expected_length = struct.unpack(">I", bytes(self.buffer[:4]))[0]
+                del self.buffer[:4]
+            if len(self.buffer) < self.expected_length:
+                break
+            payload = bytes(self.buffer[: self.expected_length])
+            del self.buffer[: self.expected_length]
+            self.expected_length = None
+            try:
+                messages.append(json.loads(payload.decode("utf-8")))
+            except Exception:
+                pass
+        return messages
+
+
+# --------------------------------------------------------------------------
+# detection
+
+
+def run(argv: list[str], timeout: float = 2.0) -> str:
+    try:
+        proc = subprocess.run(
+            argv,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.DEVNULL,
+            timeout=timeout,
+        )
+        return proc.stdout.decode("utf-8", "ignore")
+    except Exception:
+        return ""
+
+
+def cleanshot_pids() -> list[str]:
+    out = run(["pgrep", "-x", "CleanShot X"])
+    return [line.strip() for line in out.splitlines() if line.strip()]
+
+
+def looks_like_recording_file(path: str) -> bool:
+    lowered = path.lower()
+    if any(lowered.endswith(ext) for ext in VIDEO_EXTENSIONS):
+        return True
+    if "cleanshot" in lowered and "/media/" in lowered:
+        return True
+    return False
+
+
+def recording_files_for(pids: list[str]) -> str | None:
+    """Return the path of a video file CleanShot has open for writing."""
+    if not pids:
+        return None
+    out = run(["lsof", "-nP", "-F", "pfan", "-p", ",".join(pids)])
+    access = None
+    for line in out.splitlines():
+        if not line:
+            continue
+        tag, value = line[0], line[1:]
+        if tag == "f":
+            access = None
+        elif tag == "a":
+            access = value.strip().lower()
+        elif tag == "n":
+            if access in ("w", "u", "wu"):
+                if looks_like_recording_file(value):
+                    return value
+    return None
+
+
+def force_marker() -> str | None:
+    for path in FORCE_FILES:
+        if os.path.exists(path):
+            return path
+    return None
+
+
+def detect() -> tuple[bool, str]:
+    marker = force_marker()
+    if marker:
+        return True, f"force marker {marker}"
+
+    pids = cleanshot_pids()
+    if pids:
+        path = recording_files_for(pids)
+        if path:
+            return True, f"CleanShot writing {path}"
+
+    return False, "idle"
+
+
+# --------------------------------------------------------------------------
+# stop control (Accessibility)
+#
+# CleanShot X has no URL scheme or App Intent for stopping a recording, so
+# the lake button presses the "Stop Recording" item in CleanShot's menu bar
+# extra through the Accessibility API. TCC attributes the call to the app
+# that spawned this process (DynamicLake), so it needs the Accessibility
+# permission the host can request with a `requestPermission` command.
+
+STOP_TITLES = ("Stop Recording", "Stop Screen Recording")
+
+_CF = None
+_AX = None
+_AX_KEEP = []
+
+
+def _load_accessibility():
+    global _CF, _AX
+    if _AX is not None:
+        return True
+    try:
+        cf = ctypes.CDLL(ctypes.util.find_library("CoreFoundation"))
+        ax = ctypes.CDLL(
+            "/System/Library/Frameworks/ApplicationServices.framework/ApplicationServices"
+        )
+    except Exception as exc:
+        log(f"accessibility unavailable: {exc}")
+        return False
+
+    cf.CFStringCreateWithCString.restype = ctypes.c_void_p
+    cf.CFStringCreateWithCString.argtypes = [
+        ctypes.c_void_p,
+        ctypes.c_char_p,
+        ctypes.c_uint32,
+    ]
+    cf.CFRelease.restype = None
+    cf.CFRelease.argtypes = [ctypes.c_void_p]
+    cf.CFArrayGetCount.restype = ctypes.c_long
+    cf.CFArrayGetCount.argtypes = [ctypes.c_void_p]
+    cf.CFArrayGetValueAtIndex.restype = ctypes.c_void_p
+    cf.CFArrayGetValueAtIndex.argtypes = [ctypes.c_void_p, ctypes.c_long]
+    cf.CFGetTypeID.restype = ctypes.c_long
+    cf.CFGetTypeID.argtypes = [ctypes.c_void_p]
+    cf.CFArrayGetTypeID.restype = ctypes.c_long
+    cf.CFStringGetTypeID.restype = ctypes.c_long
+    cf.CFStringGetCString.restype = ctypes.c_bool
+    cf.CFStringGetCString.argtypes = [
+        ctypes.c_void_p,
+        ctypes.c_char_p,
+        ctypes.c_long,
+        ctypes.c_uint32,
+    ]
+
+    ax.AXIsProcessTrusted.restype = ctypes.c_bool
+    ax.AXUIElementCreateApplication.restype = ctypes.c_void_p
+    ax.AXUIElementCreateApplication.argtypes = [ctypes.c_int]
+    ax.AXUIElementCopyAttributeValue.restype = ctypes.c_int
+    ax.AXUIElementCopyAttributeValue.argtypes = [
+        ctypes.c_void_p,
+        ctypes.c_void_p,
+        ctypes.POINTER(ctypes.c_void_p),
+    ]
+    ax.AXUIElementPerformAction.restype = ctypes.c_int
+    ax.AXUIElementPerformAction.argtypes = [ctypes.c_void_p, ctypes.c_void_p]
+
+    _CF, _AX = cf, ax
+    return True
+
+
+def _cfstring(text: str):
+    return _CF.CFStringCreateWithCString(None, text.encode("utf-8"), 0x08000100)
+
+
+def _ax_attr(element, name: str):
+    key = _cfstring(name)
+    value = ctypes.c_void_p()
+    err = _AX.AXUIElementCopyAttributeValue(element, key, ctypes.byref(value))
+    _CF.CFRelease(key)
+    if err != 0 or not value:
+        return None
+    return value
+
+
+def _ax_string(element, name: str) -> str:
+    value = _ax_attr(element, name)
+    if not value:
+        return ""
+    try:
+        if _CF.CFGetTypeID(value) != _CF.CFStringGetTypeID():
+            return ""
+        buf = ctypes.create_string_buffer(1024)
+        if _CF.CFStringGetCString(value, buf, 1024, 0x08000100):
+            return buf.value.decode("utf-8", "replace")
+        return ""
+    finally:
+        _CF.CFRelease(value)
+
+
+def _ax_children(element) -> list:
+    return _ax_array(element, "AXChildren")
+
+
+def _ax_array(element, attribute: str) -> list:
+    value = _ax_attr(element, attribute)
+    if not value:
+        return []
+    if _CF.CFGetTypeID(value) != _CF.CFArrayGetTypeID():
+        _CF.CFRelease(value)
+        return []
+    # Keep the array alive while its borrowed child references are in use.
+    _AX_KEEP.append(value)
+    count = _CF.CFArrayGetCount(value)
+    return [_CF.CFArrayGetValueAtIndex(value, i) for i in range(count)]
+
+
+def _ax_press(element) -> int:
+    action = _cfstring("AXPress")
+    try:
+        return _AX.AXUIElementPerformAction(element, action)
+    finally:
+        _CF.CFRelease(action)
+
+
+def accessibility_trusted() -> bool:
+    if not _load_accessibility():
+        return False
+    return bool(_AX.AXIsProcessTrusted())
+
+
+TIMER_TEXT = re.compile(r"^\d{1,2}:\d{2}(:\d{2})?$")
+
+
+def _stop_from_menu(app) -> str | None:
+    extras = _ax_attr(app, "AXExtrasMenuBar")
+    if not extras:
+        return None
+    for bar_item in _ax_children(extras):
+        for menu in _ax_children(bar_item):
+            for item in _ax_children(menu):
+                if _ax_string(item, "AXTitle") not in STOP_TITLES:
+                    continue
+                err = _ax_press(item)
+                return "pressed" if err == 0 else f"press failed ({err})"
+    return None
+
+
+def _stop_from_toolbar(app) -> str | None:
+    for window in _ax_array(app, "AXWindows"):
+        children = _ax_children(window)
+        buttons = []
+        has_timer = False
+        for child in children:
+            role = _ax_string(child, "AXRole")
+            if role == "AXButton":
+                buttons.append(child)
+            elif role == "AXStaticText":
+                if TIMER_TEXT.match(_ax_string(child, "AXValue").strip()):
+                    has_timer = True
+        if has_timer and 2 <= len(buttons) <= 6:
+            err = _ax_press(buttons[0])
+            return "pressed" if err == 0 else f"press failed ({err})"
+    return None
+
+
+def stop_recording() -> str:
+    """Stop the active CleanShot recording. Returns a status string."""
+    if not _load_accessibility():
+        return "accessibility unavailable"
+    if not _AX.AXIsProcessTrusted():
+        return "untrusted"
+
+    pids = cleanshot_pids()
+    if not pids:
+        return "cleanshot not running"
+
+    del _AX_KEEP[:]
+    no_menu = False
+    for pid in pids:
+        try:
+            app = _AX.AXUIElementCreateApplication(int(pid))
+        except ValueError:
+            continue
+        if not app:
+            continue
+        result = _stop_from_menu(app)
+        if result:
+            return result
+        no_menu = True
+        result = _stop_from_toolbar(app)
+        if result:
+            return result
+    return "no stop control" if no_menu else "no cleanshot window"
+
+
+# --------------------------------------------------------------------------
+# messages
+
+
+def iso(ts: float) -> str:
+    return time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(ts))
+
+
+def dot() -> dict:
+    """Small solid red dot, like the recording indicator in the reference."""
+    return {
+        "type": "image",
+        "id": "recording-dot",
+        "source": "sfSymbol",
+        "systemImage": "circle.fill",
+        "tint": "red",
+    }
+
+
+def timer(started_at: float) -> dict:
+    return {
+        "type": "timer",
+        "id": "recording-duration",
+        "startDate": iso(started_at),
+        "endDate": iso(started_at + 24 * 3600),
+        "countsDown": False,
+        "tint": "red",
+    }
+
+
+def label(text: str, tint: str = "white") -> dict:
+    return {"type": "text", "id": "recording-label", "text": text, "tint": tint}
+
+
+def stop_button() -> dict:
+    """Safari Downloads' lake stop button, tinted red, at the host's default scale."""
+    return {
+        "type": "button",
+        "id": "stop-recording",
+        "systemImage": "stop.fill",
+        "tint": "red",
+        "actionID": "stop-recording",
+        "value": 1,
+    }
+
+
+
+def create_message(started_at: float) -> dict:
+    """Live activity: only the red dot (and the name when expanded). No timer."""
+    return {
+        "schemaVersion": SCHEMA_VERSION,
+        "requestID": f"rec-{int(started_at)}",
+        "type": "create",
+        "activityID": ACTIVITY_ID,
+        "title": PLUGIN_TITLE,
+        "priority": "high",
+        "size": "small",
+        "surfaces": {
+            "compactLiveActivity": {
+                "leftSlot": dot(),
+            },
+            "extraLiveActivity": {
+                "leftSlot": label("Screen Recording"),
+            },
+        },
+    }
+
+
+def lake_message(started_at: float) -> dict:
+    """Lake content: dot + live timer + label, with a stop button at the right."""
+    return {
+        "schemaVersion": SCHEMA_VERSION,
+        "requestID": f"lake-{int(started_at)}",
+        "type": "lake",
+        "lake": {
+            "hideHeader": True,
+            "content": [
+                {
+                    "type": "hstack",
+                    "alignment": "center",
+                    "spacing": 0,
+                    "children": [
+                        {
+                            "type": "vstack",
+                            "alignment": "leading",
+                            "spacing": 2,
+                            "children": [
+                                {
+                                    "type": "hstack",
+                                    "alignment": "center",
+                                    "spacing": 0,
+                                    "children": [dot(), timer(started_at)],
+                                },
+                                label("Screen Recording"),
+                            ],
+                        },
+                        {"type": "spacer"},
+                        stop_button(),
+                    ],
+                }
+            ],
+        },
+    }
+
+
+def clear_lake_message() -> dict:
+    return {
+        "schemaVersion": SCHEMA_VERSION,
+        "requestID": f"lake-clear-{int(time.time())}",
+        "type": "lake",
+        "lake": {"hideHeader": True, "content": []},
+    }
+
+
+def dismiss_message() -> dict:
+    return {
+        "schemaVersion": SCHEMA_VERSION,
+        "requestID": f"dismiss-{int(time.time())}",
+        "type": "dismiss",
+        "activityID": ACTIVITY_ID,
+    }
+
+
+def permission_message() -> dict:
+    return {
+        "schemaVersion": SCHEMA_VERSION,
+        "requestID": f"permission-{int(time.time())}",
+        "type": "requestPermission",
+        "permission": "accessibility",
+    }
+
+
+def strip_field(message: dict, path: str, field: str) -> bool:
+    """Remove `field` from the object found at `$.a.b`-style path."""
+    parts = [part for part in path.split(".") if part and part != "$"]
+    node = message
+    for part in parts:
+        if not isinstance(node, dict) or part not in node:
+            return False
+        node = node[part]
+    if isinstance(node, dict) and field in node:
+        del node[field]
+        return True
+    return False
+
+
+def send_with_repair(client: Client, message: dict, label: str) -> bool:
+    """Send a message, stripping fields the host rejects. Returns success."""
+    field_error = re.compile(r"(?:Invalid|Unknown) field '([^']+)' at (\$[^ ]*?)\.?$")
+    for _ in range(10):
+        request_id = message.get("requestID")
+        try:
+            client.send(message)
+        except Exception as exc:
+            log(f"{label} send failed: {exc}")
+            return False
+        deadline = time.time() + 1.2
+        stripped = False
+        answered = False
+        while time.time() < deadline:
+            try:
+                replies = client.read_available(0.1)
+            except ConnectionError:
+                log(f"{label} host closed the socket")
+                return False
+            for reply in replies:
+                if reply.get("type") not in ("response", "error"):
+                    continue
+                if reply.get("requestID") not in (None, request_id):
+                    continue
+                answered = True
+                if reply.get("ok"):
+                    if label != "update":
+                        log(f"{label} accepted")
+                    return True
+                error = str(reply.get("error", ""))
+                log(f"{label} rejected: {error}")
+                match = field_error.search(error)
+                if not match or not strip_field(message, match.group(2), match.group(1)):
+                    return False
+                stripped = True
+                break
+            if stripped:
+                break
+        if not answered:
+            log(f"{label} no reply from host")
+            return False
+        if not stripped:
+            return False
+    log(f"{label} gave up")
+    return False
+
+
+# --------------------------------------------------------------------------
+# main loop
+
+
+def main() -> int:
+    client = Client()
+    try:
+        client.connect()
+    except Exception as exc:
+        log(f"connect failed: {exc}")
+        return 1
+    log(f"connected socket={client.socket_path} pid={os.getpid()}")
+    log(f"accessibility trusted={accessibility_trusted()}")
+
+    published = False
+    last_positive = 0.0
+    last_reason = "idle"
+    frame: dict | None = None
+    started_at = 0.0
+    last_update = 0.0
+    stop_pressed_at = 0.0
+    last_stop_attempt = 0.0
+
+    while True:
+        try:
+            messages = client.read_available(0.0)
+            for message in messages:
+                log(f"host message: {json.dumps(message)[:300]}")
+                if message.get("type") != "action":
+                    continue
+                if message.get("actionID") != "stop-recording":
+                    continue
+                now = time.time()
+                if now - last_stop_attempt < 1.0:
+                    continue
+                last_stop_attempt = now
+                log("stop requested from lake button")
+                result = stop_recording()
+                log(f"stop result: {result}")
+                if result == "pressed":
+                    stop_pressed_at = time.time()
+                elif result == "untrusted":
+                    send_with_repair(client, permission_message(), "permission")
+        except ConnectionError:
+            log("host closed the socket")
+            return 0
+        except Exception:
+            pass
+
+        active, reason = detect()
+        if active:
+            last_positive = time.time()
+        linger = 0.6 if (time.time() - stop_pressed_at) < 15 else LINGER_SECONDS
+        wanting = active or (time.time() - last_positive) < linger
+
+        if reason != last_reason:
+            log(f"state: {reason} (wanting={wanting})")
+            last_reason = reason
+
+        now = time.time()
+        if wanting and not published:
+            if frame is None:
+                if not send_with_repair(client, lake_message(now), "lake"):
+                    log("lake content rejected; continuing without it")
+                frame = create_message(now)
+            ok = send_with_repair(client, frame, "create")
+            published = ok
+            started_at = now
+            last_update = now
+            if not ok:
+                frame = None
+                time.sleep(2.0)
+        elif wanting and published and (now - last_update) >= UPDATE_INTERVAL:
+            update = json.loads(json.dumps(frame))
+            update["type"] = "update"
+            update["requestID"] = f"update-{int(now)}"
+            send_with_repair(client, update, "update")
+            last_update = now
+        elif not wanting and published:
+            send_with_repair(client, dismiss_message(), "dismiss")
+            send_with_repair(client, clear_lake_message(), "lake-clear")
+            published = False
+            frame = None
+
+        time.sleep(POLL_INTERVAL)
+
+
+if __name__ == "__main__":
+    try:
+        sys.exit(main())
+    except KeyboardInterrupt:
+        sys.exit(0)
