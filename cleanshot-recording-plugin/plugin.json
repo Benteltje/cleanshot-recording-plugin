@@ -2,7 +2,7 @@
   "schemaVersion": 1,
   "identifier": "com.benjamin.cleanshot-recording",
   "name": "CleanShot Recording",
-  "version": "1.0.0",
+  "version": "1.0.1",
   "developerName": "Benteltje",
   "description": "Shows a red dot in the notch and a \"Screen Recording\" card with a live timer and a red stop button in the lake while CleanShot X records the screen.",
   "executable": "cleanshot-monitor",
