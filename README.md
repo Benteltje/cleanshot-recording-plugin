@@ -20,7 +20,7 @@ button.
 | File | Purpose |
 | --- | --- |
 | `plugin.json` | DynamicLake plugin manifest |
-| `cleanshot-monitor` | Python 3 monitor (executable) |
+| `cleanshot-monitor` | Swift monitor (executable) |
 | `icon.png` | Plugin icon |
 
 ## Requirements
