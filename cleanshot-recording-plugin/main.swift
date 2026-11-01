@@ -114,14 +114,41 @@ func run(_ arguments: [String], timeout: TimeInterval = 2) -> String {
     process.executableURL = URL(fileURLWithPath: "/usr/bin/env")
     process.arguments = arguments
     let output = Pipe()
-    let errors = Pipe()
     process.standardOutput = output
-    process.standardError = errors
-    do { try process.run() } catch { return "" }
+    process.standardError = FileHandle.nullDevice
+
+    // Drain stdout while the child runs. Waiting until exit can deadlock once
+    // lsof fills the pipe's kernel buffer (typically 64 KB).
+    let reader = output.fileHandleForReading
+    let writer = output.fileHandleForWriting
+    let readerFinished = DispatchGroup()
+    var capturedOutput = Data()
+    let outputLock = NSLock()
+    readerFinished.enter()
+    DispatchQueue.global(qos: .utility).async {
+        let data = reader.readDataToEndOfFile()
+        outputLock.lock()
+        capturedOutput = data
+        outputLock.unlock()
+        readerFinished.leave()
+    }
+    do {
+        try process.run()
+    } catch {
+        try? writer.close()
+        readerFinished.wait()
+        try? reader.close()
+        return ""
+    }
+    try? writer.close()
     let deadline = Date().addingTimeInterval(timeout)
     while process.isRunning && Date() < deadline { Thread.sleep(forTimeInterval: 0.02) }
     if process.isRunning { process.terminate(); process.waitUntilExit() }
-    return String(data: output.fileHandleForReading.readDataToEndOfFile(), encoding: .utf8) ?? ""
+    readerFinished.wait()
+    try? reader.close()
+    outputLock.lock()
+    defer { outputLock.unlock() }
+    return String(data: capturedOutput, encoding: .utf8) ?? ""
 }
 
 func cleanShotPIDs() -> [String] { run(["pgrep", "-x", "CleanShot X"]).split(separator: "\n").map { String($0) } }
@@ -145,11 +172,42 @@ func recordingFile(for pids: [String]) -> String? {
     return nil
 }
 
-func detect() -> (Bool, String) {
-    for marker in forceFiles where FileManager.default.fileExists(atPath: marker) { return (true, "force marker \(marker)") }
-    let pids = cleanShotPIDs()
-    if let path = recordingFile(for: pids) { return (true, "CleanShot writing \(path)") }
-    return (false, "idle")
+final class RecordingDetector {
+    private let pidRefreshInterval: TimeInterval = 1.0
+    private let inactiveScanInterval: TimeInterval = 1.0
+    private var pids = [String]()
+    private var lastPIDRefresh = Date.distantPast
+    private var lastScan = Date.distantPast
+    private var lastResult: (Bool, String) = (false, "idle")
+
+    private func pidIsRunning(_ value: String) -> Bool {
+        guard let pid = pid_t(value) else { return false }
+        return Darwin.kill(pid, 0) == 0 || errno == EPERM
+    }
+
+    func detect() -> (Bool, String) {
+        for marker in forceFiles where FileManager.default.fileExists(atPath: marker) {
+            return (true, "force marker \(marker)")
+        }
+
+        let now = Date()
+        if now.timeIntervalSince(lastPIDRefresh) >= pidRefreshInterval || !pids.allSatisfy(pidIsRunning) {
+            pids = cleanShotPIDs()
+            lastPIDRefresh = now
+        }
+
+        // While idle, avoid repeatedly spawning lsof. During a recording we
+        // keep the original 0.4-second cadence so dismissal remains prompt.
+        let scanInterval: TimeInterval = lastResult.0 ? pollInterval : inactiveScanInterval
+        guard now.timeIntervalSince(lastScan) >= scanInterval else { return lastResult }
+        lastScan = now
+        if let path = recordingFile(for: pids) {
+            lastResult = (true, "CleanShot writing \(path)")
+        } else {
+            lastResult = (false, "idle")
+        }
+        return lastResult
+    }
 }
 
 func axAttribute(_ element: AXUIElement, _ attribute: CFString) -> CFTypeRef? {
@@ -276,6 +334,7 @@ func main() -> Int32 {
     do { try client.connect() } catch { log("connect failed: \(error)"); return 1 }
     log("connected socket=\(client.socketPath) pid=\(getpid())")
     log("accessibility trusted=\(AXIsProcessTrusted())")
+    let detector = RecordingDetector()
     var published = false, lastPositive = Date.distantPast, lastReason = "idle", frame: [String: Any]?
     var startedAt = Date.distantPast, lastUpdate = Date.distantPast, stopPressedAt = Date.distantPast, lastStopAttempt = Date.distantPast
     while true {
@@ -289,7 +348,7 @@ func main() -> Int32 {
                 else if result == "untrusted" { _ = sendWithRepair(client, permissionMessage(), "permission") }
             }
         } catch { log("host closed the socket"); return 0 }
-        let (active, reason) = detect()
+        let (active, reason) = detector.detect()
         let now = Date()
         if active { lastPositive = now }
         let linger: TimeInterval = now.timeIntervalSince(stopPressedAt) < 15 ? 0.6 : lingerSeconds
