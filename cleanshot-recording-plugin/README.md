@@ -2,7 +2,8 @@
 
 A DynamicLake JSON plugin that shows a CleanShot X screen-recording indicator in
 the notch and a recording card in the lake with a live timer and a red stop
-button.
+button. When the recording finishes, the card turns into a preview with a video
+thumbnail, duration, filename, and quick actions.
 
 ## Features
 
@@ -13,15 +14,20 @@ button.
   and a red stop button.
 - Pressing the stop button stops the active CleanShot X recording through
   Accessibility (toolbar stop button, with menu-extra fallback).
-- Card dismisses and clears itself shortly after recording ends.
+- While the recording is being saved the stop button becomes a spinner: a
+  white arc that keeps turning around the red square, with the card relabelled
+  "Saving Recording…", until the preview replaces it.
+- After stopping, the live card is replaced by a preview with the recording's
+  thumbnail, duration, filename, and folder.
+- Preview actions: Watch, Show in Finder, Copy, and Delete. The preview hides
+  after about ten seconds, or shortly after the lake is closed.
 
 ## Files
 
 | File | Purpose |
 | --- | --- |
 | `plugin.json` | DynamicLake plugin manifest |
-| `main.swift` | Swift source for the native monitor |
-| `cleanshot-monitor` | Native macOS monitor (executable) |
+| `cleanshot-monitor` | Swift monitor (executable) |
 | `icon.png` | Plugin icon |
 
 ## Requirements
@@ -39,15 +45,7 @@ this folder under:
 ~/Library/Application Support/DynamicLake/Plugins/JSON/
 ```
 
-`cleanshot-monitor` must be executable (`chmod +x`). Python is not required.
-
-## Rebuild
-
-On Apple silicon Macs, rebuild the executable from source with:
-
-```sh
-swiftc -O -target arm64-apple-macosx13.0 -framework ApplicationServices main.swift -o cleanshot-monitor
-```
+`cleanshot-monitor` must be executable (`chmod +x`).
 
 ## How it works
 
@@ -55,7 +53,10 @@ The monitor keeps a JSON socket connection to the host and polls `lsof` for a
 video file that CleanShot X has open for writing. While such a file exists the
 plugin publishes a notification-lake card. Pressing the stop button sends an
 Accessibility action to CleanShot X's recording toolbar. When the file is closed
-the card is cleared and the activity dismissed.
+the plugin waits for CleanShot to finish writing (it renames its temporary `.mov`
+to the final `.mp4`), grabs a frame with AVFoundation for the thumbnail, and
+swaps the card for the preview. A copy already exported to Desktop, Downloads,
+Movies, or Documents is preferred when its duration matches.
 
 ## License
 
