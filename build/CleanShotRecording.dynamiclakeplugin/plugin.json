@@ -2,7 +2,7 @@
   "schemaVersion": 1,
   "identifier": "com.benjamin.cleanshot-recording",
   "name": "CleanShot Recording",
-  "version": "2.0.0",
+  "version": "2.1.0",
   "developerName": "Benteltje",
   "description": "Shows a red dot in the notch and a \"Screen Recording\" card with a live timer and CleanShot-style stop button while CleanShot X records the screen. When recording ends, a preview card shows a thumbnail, duration, filename, and Watch / Show in Finder / Copy / Delete actions.",
   "executable": "cleanshot-monitor",
